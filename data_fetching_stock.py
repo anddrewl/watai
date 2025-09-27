@@ -1,0 +1,177 @@
+import praw
+import requests
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import json
+import os
+import time
+
+REDDIT_CLIENT_ID = 'bsKMMMkoaVuWVWQkTleVrw'
+REDDIT_CLIENT_SECRET = 'oz78ES_veF_MHmjjCbMtSoi03bT7Dw'
+REDDIT_USER_AGENT = 'data_fetching_stock'
+TICKER = 'TSLA' # or 'NVDA'
+SUBREDDITS = ['wallstreetbets', 'stocks', 'investing']
+START_DATE = datetime(2022, 9, 26)
+END_DATE = datetime(2025, 9, 26)
+DATA_DIR = 'reddit_data'
+FINANCIAL_DATA_DIR = 'financial_data'
+DUMP_FILE = 'path_to_your_dump/processed.jsonl'
+
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(FINANCIAL_DATA_DIR, exist_ok=True)
+
+reddit = praw.Reddit(
+    client_id=REDDIT_CLIENT_ID,
+    client_secret=REDDIT_CLIENT_SECRET,
+    user_agent=REDDIT_USER_AGENT
+)
+
+analyzer = SentimentIntensityAnalyzer()
+
+def fetch_historical_with_praw():
+    """Fetch up to ~1k posts per subreddit via PRAW (fallback if no dump)."""
+    posts = []
+    for sub in SUBREDDITS:
+        try:
+            for submission in reddit.subreddit(sub).search(
+                    f"{TICKER} OR ${TICKER}",
+                    time_filter='all',
+                    sort='new',
+                    limit=1000):
+                created = datetime.fromtimestamp(submission.created_utc)
+                if START_DATE <= created <= END_DATE:
+                    text = f"{submission.title} {submission.selftext}".lower()
+                    if TICKER.lower() in text or f"${TICKER}".lower() in text:
+                        posts.append({
+                            'id': submission.id,
+                            'title': submission.title,
+                            'selftext': submission.selftext,
+                            'score': submission.score,
+                            'created_utc': created,
+                            'subreddit': sub,
+                            'url': submission.url
+                        })
+        except Exception as e:
+            print(f"Error fetching r/{sub}: {e}")
+    print(f"[PRAW] Retrieved {len(posts)} posts for {TICKER}")
+    # save
+    with open(f"{DATA_DIR}/historical_{TICKER}.json", 'w') as f:
+        json.dump(posts, f, default=str, indent=2)
+    return posts
+
+def process_historical_dump(dump_path):
+    """Load a Pushshift JSONL dump and filter by date/subreddit/ticker."""
+    posts = []
+    with open(dump_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            obj = json.loads(line)
+            created = datetime.utcfromtimestamp(obj['created_utc'])
+            if not (START_DATE <= created <= END_DATE):
+                continue
+            if obj.get('subreddit', '').lower() not in SUBREDDITS:
+                continue
+            text = f"{obj.get('title','')} {obj.get('selftext','')}".lower()
+            if TICKER.lower() in text or f"${TICKER}".lower() in text:
+                posts.append({
+                    'id': obj['id'],
+                    'title': obj['title'],
+                    'selftext': obj.get('selftext', ''),
+                    'score': obj.get('score', 0),
+                    'created_utc': created,
+                    'subreddit': obj['subreddit'],
+                    'url': f"https://reddit.com{obj.get('permalink','')}"
+                })
+    print(f"[Dump] Processed {len(posts)} posts for {TICKER}")
+    with open(f"{DATA_DIR}/filtered_{TICKER}.json", 'w') as f:
+        json.dump(posts, f, default=str, indent=2)
+    return posts
+
+def load_historical_posts():
+    """If dump exists use it, otherwise fallback to PRAW."""
+    if os.path.isfile(DUMP_FILE):
+        return process_historical_dump(DUMP_FILE)
+    else:
+        return fetch_historical_with_praw()
+
+def compute_sentiment(posts):
+    """Compute daily avg VADER sentiment; safeguard empty lists."""
+    if not posts:
+        return pd.DataFrame(columns=['date', 'sentiment'])
+    records = []
+    for p in posts:
+        txt = f"{p['title']} {p.get('selftext','')}".strip()
+        if len(txt) < 5:
+            continue
+        score = analyzer.polarity_scores(txt)['compound']
+        date = p['created_utc'].date() if isinstance(p['created_utc'], datetime) else datetime.fromisoformat(p['created_utc']).date()
+        records.append({'date': date, 'sentiment': score})
+    df = pd.DataFrame(records)
+    if df.empty:
+        return pd.DataFrame(columns=['date', 'sentiment'])
+    df['date'] = pd.to_datetime(df['date'])
+    daily = df.groupby('date')['sentiment'].mean().reset_index()
+    return daily
+
+def fetch_financial_data(ticker, start, end):
+    """Grab daily Close & Volume; return DataFrame with Date index."""
+    stock = yf.Ticker(ticker)
+    hist = stock.history(start=start, end=end)
+    if hist.empty:
+        raise ValueError(f"No financial data for {ticker}")
+    hist = hist.reset_index()[['Date', 'Close', 'Volume']]
+    hist['Date'] = pd.to_datetime(hist['Date']).dt.date
+    hist.set_index('Date', inplace=True)
+    hist.to_csv(f"{FINANCIAL_DATA_DIR}/{ticker}_historical.csv")
+    print(f"Fetched {len(hist)} days of {ticker} data")
+    return hist
+
+def align_and_plot(sent_df, fin_df):
+    """Join sentiment + price, compute correlation, and plot."""
+    if sent_df.empty or fin_df.empty:
+        print("No data to align/plot.")
+        return None, None
+
+    sent_df = sent_df.set_index('date').rename_axis('Date')
+    fin_df = fin_df.copy()
+    combo = fin_df.join(sent_df, how='inner')
+    if combo.empty:
+        print("No overlapping dates.")
+        return None, None
+
+    combo['next_return'] = combo['Close'].pct_change().shift(-1)
+    corr = combo['sentiment'].corr(combo['next_return'])
+    print(f"Correlation sentiment → next‐day return: {corr:.4f}")
+
+    # Plot
+    fig, ax1 = plt.subplots(figsize=(12,6))
+    ax1.plot(combo.index, combo['Close'], color='tab:blue', label='Close')
+    ax1.set_ylabel('Price', color='tab:blue')
+    ax1.tick_params(axis='y', labelcolor='tab:blue', colors='tab:blue')
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+    ax2.plot(combo.index, combo['sentiment'], color='tab:red', label='Sentiment')
+    ax2.set_ylabel('Sentiment', color='tab:red')
+    ax2.tick_params(axis='y', labelcolor='tab:red',  colors='tab:red')
+
+    plt.title(f"{TICKER} Price vs Reddit Sentiment corr={corr:.3f}")
+    fig.tight_layout()
+    plt.savefig(f"{TICKER}_sentiment_analysis.png", dpi=300)
+    plt.show()
+
+    return combo, corr
+
+def main():
+    posts = load_historical_posts()
+    daily_sent = compute_sentiment(posts)
+    fin = fetch_financial_data(TICKER, START_DATE, END_DATE)
+    aligned, _ = align_and_plot(daily_sent, fin)
+    if aligned is not None:
+        print("Analysis successful ✅")
+
+if __name__ == "__main__":
+    main()
