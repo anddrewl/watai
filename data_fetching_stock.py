@@ -10,19 +10,18 @@ import json
 import os
 import time
 
-REDDIT_CLIENT_ID = 'bsKMMMkoaVuWVWQkTleVrw'
-REDDIT_CLIENT_SECRET = 'oz78ES_veF_MHmjjCbMtSoi03bT7Dw'
+REDDIT_CLIENT_ID = 'bsKMMMkoaVuWVWQkTleVrw' # Replace with your own
+REDDIT_CLIENT_SECRET = 'oz78ES_veF_MHmjjCbMtSoi03bT7Dw' # Replace with your own
 REDDIT_USER_AGENT = 'data_fetching_stock'
-TICKER = 'TSLA' # or 'NVDA'
+TICKER = 'META' # or 'NVDA'
 SUBREDDITS = ['wallstreetbets', 'stocks', 'investing']
-START_DATE = datetime(2022, 9, 26)
-END_DATE = datetime(2025, 9, 26)
-DATA_DIR = 'reddit_data'
-FINANCIAL_DATA_DIR = 'financial_data'
-DUMP_FILE = 'path_to_your_dump/processed.jsonl'
+START_DATE = datetime(2022, 9, 27)
+END_DATE = datetime(2025, 9, 27)
+DUMP_FILE = 'path_to_dump/processed.jsonl'
 
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(FINANCIAL_DATA_DIR, exist_ok=True)
+os.makedirs('reddit_data', exist_ok=True)
+os.makedirs('financial_data', exist_ok=True)
+os.makedirs('plots', exist_ok=True)
 
 reddit = praw.Reddit(
     client_id=REDDIT_CLIENT_ID,
@@ -59,7 +58,7 @@ def fetch_historical_with_praw():
             print(f"Error fetching r/{sub}: {e}")
     print(f"[PRAW] Retrieved {len(posts)} posts for {TICKER}")
     # save
-    with open(f"{DATA_DIR}/historical_{TICKER}.json", 'w') as f:
+    with open(f"reddit_data/historical_{TICKER}.json", 'w') as f:
         json.dump(posts, f, default=str, indent=2)
     return posts
 
@@ -86,7 +85,7 @@ def process_historical_dump(dump_path):
                     'url': f"https://reddit.com{obj.get('permalink','')}"
                 })
     print(f"[Dump] Processed {len(posts)} posts for {TICKER}")
-    with open(f"{DATA_DIR}/filtered_{TICKER}.json", 'w') as f:
+    with open(f"reddit_data/filtered_{TICKER}.json", 'w') as f:
         json.dump(posts, f, default=str, indent=2)
     return posts
 
@@ -125,7 +124,7 @@ def fetch_financial_data(ticker, start, end):
     hist = hist.reset_index()[['Date', 'Close', 'Volume']]
     hist['Date'] = pd.to_datetime(hist['Date']).dt.date
     hist.set_index('Date', inplace=True)
-    hist.to_csv(f"{FINANCIAL_DATA_DIR}/{ticker}_historical.csv")
+    hist.to_csv(f"financial_data/{ticker}_historical.csv")
     print(f"Fetched {len(hist)} days of {ticker} data")
     return hist
 
@@ -160,7 +159,7 @@ def align_and_plot(sent_df, fin_df):
 
     plt.title(f"{TICKER} Price vs Reddit Sentiment corr={corr:.3f}")
     fig.tight_layout()
-    plt.savefig(f"{TICKER}_sentiment_analysis.png", dpi=300)
+    plt.savefig(f"plots/{TICKER}_sentiment_analysis.png", dpi=300)
     plt.show()
 
     return combo, corr
