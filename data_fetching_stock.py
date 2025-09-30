@@ -9,6 +9,8 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import json
 import os
 import time
+import sqlite3
+import re
 
 REDDIT_CLIENT_ID = 'bsKMMMkoaVuWVWQkTleVrw' # Replace with your own
 REDDIT_CLIENT_SECRET = 'oz78ES_veF_MHmjjCbMtSoi03bT7Dw' # Replace with your own
