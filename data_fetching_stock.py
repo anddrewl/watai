@@ -15,10 +15,10 @@ import re
 REDDIT_CLIENT_ID = 'bsKMMMkoaVuWVWQkTleVrw' # Replace with your own
 REDDIT_CLIENT_SECRET = 'oz78ES_veF_MHmjjCbMtSoi03bT7Dw' # Replace with your own
 REDDIT_USER_AGENT = 'data_fetching_stock'
-TICKER = 'TSLA' # Change to your desired stock ticker symbol
+TICKER = 'AAPL' # Change to your desired stock ticker symbol
 SUBREDDITS = ['wallstreetbets', 'stocks', 'investing']
-START_DATE = datetime(2022, 9, 27)
-END_DATE = datetime(2025, 9, 27)
+START_DATE = datetime(2022, 10, 3)
+END_DATE = datetime(2025, 10, 3)
 DUMP_FILE = 'path_to_dump/processed.jsonl' # Replace with your pre-downloaded Reddit dump file if you have one
 
 os.makedirs('reddit_data', exist_ok=True)
