@@ -36,6 +36,7 @@ analyzer = SentimentIntensityAnalyzer()
 def fetch_historical_with_praw():
     """Fetches the most recent 1000 posts per subreddit via PRAW (fallback if no dump)."""
     posts = []
+    comments_list = []
     for sub in SUBREDDITS:
         try:
             for submission in reddit.subreddit(sub).search(
@@ -47,22 +48,45 @@ def fetch_historical_with_praw():
                 if START_DATE <= created <= END_DATE:
                     text = f"{submission.title} {submission.selftext}".lower()
                     if TICKER.lower() in text or f"${TICKER}".lower() in text:
-                        posts.append({
+                        media_url = None
+                        if submission.media and 'reddit_video' in submission.media:
+                            media_url = submission.media['reddit_video']['fallback_url']
+                        elif not submission.is_self and submission.url.endswith(('.jpg', '.png', '.gif', '.mp4')):
+                            media_url = submission.url
+                        post_dict = {
                             'id': submission.id,
                             'title': submission.title,
                             'selftext': submission.selftext,
                             'score': submission.score,
                             'created_utc': created,
                             'subreddit': sub,
-                            'url': submission.url
-                        })
+                            'url': submission.url,
+                            'author': submission.author.name if submission.author else '[deleted]',
+                            'upvote_ratio': submission.upvote_ratio,
+                            'num_comments': submission.num_comments,
+                            'media': media_url
+                        }
+                        posts.append(post_dict)
+                        # fetch comments
+                        submission.comments.replace_more(limit=0)
+                        for comment in submission.comments.list():
+                            com_dict = {
+                                'post_platform_id': submission.id,
+                                'platform_comment_id': comment.id,
+                                'body': comment.body,
+                                'author': comment.author.name if comment.author else '[deleted]',
+                                'created_utc': datetime.fromtimestamp(comment.created_utc),
+                                'score_likes': comment.score,
+                                'media': None
+                            }
+                            comments_list.append(com_dict)
         except Exception as e:
             print(f"Error fetching r/{sub}: {e}")
     print(f"[PRAW] Retrieved {len(posts)} posts for {TICKER}")
     # save
     with open(f"reddit_data/historical_{TICKER}.json", 'w') as f:
         json.dump(posts, f, default=str, indent=2)
-    return posts
+    return posts, comments_list
 
 def process_historical_dump(dump_path):
     """Load a Pushshift JSONL dump and filter by date/subreddit/ticker."""
@@ -77,19 +101,27 @@ def process_historical_dump(dump_path):
                 continue
             text = f"{obj.get('title','')} {obj.get('selftext','')}".lower()
             if TICKER.lower() in text or f"${TICKER}".lower() in text:
-                posts.append({
+                media_url = obj.get('url') if obj.get('is_self', False) else None
+                if 'media' in obj:
+                    media_url = obj['media']
+                post_dict = {
                     'id': obj['id'],
                     'title': obj['title'],
                     'selftext': obj.get('selftext', ''),
                     'score': obj.get('score', 0),
                     'created_utc': created,
                     'subreddit': obj['subreddit'],
-                    'url': f"https://reddit.com{obj.get('permalink','')}"
-                })
+                    'url': f"https://reddit.com{obj.get('permalink','')}",
+                    'author': obj.get('author', '[deleted]'),
+                    'upvote_ratio': obj.get('upvote_ratio'),
+                    'num_comments': obj.get('num_comments', 0),
+                    'media': media_url
+                }
+                posts.append(post_dict)
     print(f"[Dump] Processed {len(posts)} posts for {TICKER}")
     with open(f"reddit_data/filtered_{TICKER}.json", 'w') as f:
         json.dump(posts, f, default=str, indent=2)
-    return posts
+    return posts, []
 
 def load_historical_posts():
     """Attempts to use pre-downloaded Reddit data dump if available for efficiency sake, otherwise it runs live PRAW API queries."""
@@ -116,6 +148,21 @@ def compute_sentiment(posts):
     df['date'] = pd.to_datetime(df['date'])
     daily = df.groupby('date')['sentiment'].mean().reset_index()
     return daily
+
+def extract_entities(text):
+    """Extract tickers, hashtags, and mentions from text."""
+    tickers = re.findall(r'\$\s*([A-Z]{1,5})\b', text.upper())
+    hashtags = re.findall(r'#\s*(\w+)', text)
+    mentions = re.findall(r'@\s*(\w+)', text)
+    entities = [('ticker', t) for t in tickers] + [('hashtag', h) for h in hashtags] + [('mention', m) for m in mentions]
+    return entities
+
+def compute_sentiment_score_and_label(txt):
+    if len(txt.strip()) < 5:
+        return None, None
+    score = analyzer.polarity_scores(txt)['compound']
+    label = 'positive' if score > 0.05 else 'negative' if score < -0.05 else 'neutral'
+    return score, label
 
 def fetch_financial_data(ticker, start, end):
     """Retrieve historical stock data from Yahoo Finance"""
@@ -167,12 +214,155 @@ def align_and_plot(sent_df, fin_df):
     return combo, corr
 
 def main():
-    posts = load_historical_posts()
+    posts, comments = load_historical_posts()
     daily_sent = compute_sentiment(posts)
     fin = fetch_financial_data(TICKER, START_DATE, END_DATE)
     aligned, _ = align_and_plot(daily_sent, fin)
     if aligned is not None:
         print("Analysis successful ✅")
+    
+    conn = sqlite3.connect('data_fetched.sqlite')
+    cursor = conn.cursor()
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS posts (
+        id INTEGER PRIMARY KEY,
+        platform TEXT,
+        platform_post_id TEXT,
+        title TEXT,
+        body TEXT,
+        author TEXT,
+        subreddit_channel TEXT,
+        created_utc DATETIME,
+        score_likes INTEGER,
+        upvote_ratio REAL,
+        num_comments INTEGER,
+        url TEXT,
+        collected_at DATETIME,
+        media TEXT
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS comments (
+        id INTEGER PRIMARY KEY,
+        post_id INTEGER,
+        platform_comment_id TEXT,
+        body TEXT,
+        author TEXT,
+        created_utc DATETIME,
+        score_likes INTEGER,
+        collected_at DATETIME,
+        media TEXT
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        platform TEXT,
+        platform_user_id TEXT,
+        username TEXT,
+        display_name TEXT,
+        followers_count INTEGER,
+        description TEXT,
+        collected_at DATETIME
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS post_entities (
+        post_id INTEGER,
+        entity_type TEXT,
+        value TEXT,
+        PRIMARY KEY (post_id, entity_type, value)
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS features (
+        id INTEGER PRIMARY KEY,
+        ref_type TEXT,
+        ref_id INTEGER,
+        sentiment_label TEXT,
+        sentiment_score REAL,
+        topics TEXT,
+        model_version TEXT,
+        processed_at DATETIME
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS prices (
+        id INTEGER PRIMARY KEY,
+        ticker TEXT,
+        ts DATETIME,
+        open REAL,
+        high REAL,
+        low REAL,
+        close REAL,
+        volume REAL,
+        source TEXT
+    )''')
+
+    collected_at = datetime.now()
+
+    # NEED TO FIX THE DATABASE INSERTIONS BELOW (running into some errors)
+
+    # insert posts and related data
+    post_ids = {}
+    for p in posts:
+        cursor.execute('''INSERT INTO posts (platform, platform_post_id, title, body, author, subreddit_channel, created_utc, score_likes, upvote_ratio, num_comments, url, collected_at, media)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  ('reddit', p['id'], p['title'], p['selftext'], p['author'], p['subreddit'], p['created_utc'], p['score'], p.get('upvote_ratio'), p['num_comments'], p['url'], collected_at, p.get('media')))
+        post_id = cursor.lastrowid
+        post_ids[p['id']] = post_id
+
+        # post features
+        txt = f"{p['title']} {p['selftext']}"
+        sentiment_score, sentiment_label = compute_sentiment_score_and_label(txt)
+        if sentiment_score is not None:
+            cursor.execute('''INSERT INTO features (ref_type, ref_id, sentiment_label, sentiment_score, topics, model_version, processed_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                      ('post', post_id, sentiment_label, sentiment_score, None, 'vader', datetime.now()))
+
+        # post entities
+        entities = extract_entities(txt)
+        for entity_type, value in entities:
+            try:
+                cursor.execute('''INSERT INTO post_entities (post_id, entity_type, value) VALUES (?, ?, ?)''',
+                          (post_id, entity_type, value))
+            except sqlite3.IntegrityError:
+                pass  # Duplicate entry
+
+    # insert comments and features
+    for com in comments:
+        post_id = post_ids.get(com['post_platform_id'])
+        if post_id:
+            cursor.execute('''INSERT INTO comments (post_id, platform_comment_id, body, author, created_utc, score_likes, collected_at, media)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                      (post_id, com['platform_comment_id'], com['body'], com['author'], com['created_utc'], com['score_likes'], collected_at, com['media']))
+            comment_id = cursor.lastrowid
+
+            sentiment_score, sentiment_label = compute_sentiment_score_and_label(com['body'])
+            if sentiment_score is not None:
+                cursor.execute('''INSERT INTO features (ref_type, ref_id, sentiment_label, sentiment_score, topics, model_version, processed_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                          ('comment', comment_id, sentiment_label, sentiment_score, None, 'vader', datetime.now()))
+
+    # insert users into tables
+    authors = set(p['author'] for p in posts if p['author'] != '[deleted]') | set(com['author'] for com in comments if com['author'] != '[deleted]')
+    for author in authors:
+        try:
+            cursor.execute('''INSERT INTO users (platform, platform_user_id, username, display_name, followers_count, description, collected_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                      ('reddit', author, author, author, None, None, collected_at))
+        except sqlite3.IntegrityError:
+            pass
+
+    # insert prices to tables
+    fin_reset = fin.reset_index()
+    fin_reset.rename(columns={'Date': 'ts', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
+    fin_reset['ticker'] = TICKER
+    fin_reset['source'] = 'Yahoo Finance'
+    fin_reset['ts'] = pd.to_datetime(fin_reset['ts'])
+    for _, row in fin_reset.iterrows():
+        cursor.execute('''INSERT INTO prices (ticker, ts, open, high, low, close, volume, source)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (row['ticker'], row['ts'], row['open'], row['high'], row['low'], row['close'], row['volume'], row['source']))
+
+    conn.commit()
+    conn.close()
+    print("Data inserted into database successfully.")
 
 if __name__ == "__main__":
     main()
